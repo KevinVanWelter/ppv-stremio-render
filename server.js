@@ -3,6 +3,7 @@ const puppeteer = require('puppeteer');
 const https = require('https');
 const http = require('http');
 const { URL } = require('url');
+require('dotenv').config();
 
 // ============================================================================
 // CONFIGURATION
