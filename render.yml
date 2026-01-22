@@ -1,19 +1,10 @@
-{
-  "name": "ppv-stremio-render",
-  "version": "1.0.0",
-  "description": "PPV.to Stremio addon for Render.com",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "keywords": ["stremio", "addon", "sports", "live"],
-  "author": "",
-  "license": "MIT",
-  "dependencies": {
-    "express": "^4.18.2",
-    "puppeteer": "^21.6.1"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
-}
+services:
+  - type: web
+    name: ppv-stremio-addon
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: NODE_ENV
+        value: production
