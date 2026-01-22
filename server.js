@@ -1,0 +1,676 @@
+const express = require('express');
+const puppeteer = require('puppeteer');
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+const PORT = process.env.PORT || 10000;
+const SCRAPE_INTERVAL = 90 * 1000; // 90 seconds - very frequent!
+const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+
+// ============================================================================
+// STATE
+// ============================================================================
+
+let cachedStreams = [];
+let lastScrapeTime = null;
+let isScraping = false;
+
+// ============================================================================
+// SCRAPER
+// ============================================================================
+
+async function scrapePPVLiveStreams() {
+  let browser;
+  
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled'
+      ],
+      timeout: 30000
+    });
+    
+    const page = await browser.newPage();
+    
+    page.on('popup', async popup => {
+      await popup.close();
+    });
+    
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      window.chrome = { runtime: {} };
+      window.open = function() { return null; };
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    });
+    
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1920, height: 1080 });
+    
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br'
+    });
+    
+    console.log('🏠 Navigating to ppv.to...');
+    
+    try {
+      await page.goto('https://ppv.to/', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+    } catch (e) {
+      console.log('⚠️  Page load timeout, continuing...');
+    }
+    
+    console.log('✅ PPV.to loaded');
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    console.log('🔍 Scraping live games...');
+    
+    const liveEvents = await page.evaluate(() => {
+      const events = [];
+      let liveNowElement = null;
+      const allElements = Array.from(document.querySelectorAll('*'));
+      
+      for (const el of allElements) {
+        const text = (el.textContent || '').trim();
+        const lowerText = text.toLowerCase();
+        
+        if (!liveNowElement && lowerText === 'live now' && 
+            (el.tagName.match(/H[1-6]/) || el.innerHTML.includes('🔴') || text.includes('🔴'))) {
+          liveNowElement = el;
+          break;
+        }
+      }
+      
+      if (!liveNowElement) {
+        return { events, error: 'Could not find Live now heading' };
+      }
+      
+      let gamesContainer = liveNowElement.parentElement;
+      while (gamesContainer && !gamesContainer.querySelectorAll('a[href*="/live/"]').length) {
+        gamesContainer = gamesContainer.parentElement;
+      }
+      
+      if (!gamesContainer) {
+        return { events, error: 'Could not find games container' };
+      }
+      
+      const allGameLinks = Array.from(gamesContainer.querySelectorAll('a[href*="/live/"]'));
+      const seenHrefs = new Set();
+      const seenTitles = new Set();
+      
+      for (const link of allGameLinks) {
+        const href = link.getAttribute('href') || '';
+        
+        if (href.includes('jump') || href.includes('category') || href === '/live/sports') {
+          continue;
+        }
+        
+        if (seenHrefs.has(href)) {
+          continue;
+        }
+        
+        const card = link.closest('[class*="card"], [class*="item"], div');
+        if (!card) {
+          continue;
+        }
+        
+        const titleEl = card.querySelector('h5, h4, h3, [class*="title"]');
+        let title = '';
+        
+        if (titleEl) {
+          const allH5s = card.querySelectorAll('h5');
+          title = allH5s.length > 0 ? allH5s[0].textContent.trim() : titleEl.textContent.trim();
+        } else {
+          title = card.textContent.trim().split('\n')[0].trim();
+        }
+        
+        title = title.replace(/\s+/g, ' ').trim();
+        
+        if (seenTitles.has(title)) {
+          continue;
+        }
+        
+        const channelEl = card.querySelector('[class*="channel"], [class*="network"]');
+        const channel = channelEl ? channelEl.textContent.trim() : '';
+        
+        if (href && title && title.length > 3) {
+          seenHrefs.add(href);
+          seenTitles.add(title);
+          
+          events.push({
+            title: title,
+            channel: channel,
+            href: href.startsWith('http') ? href : `https://ppv.to${href}`
+          });
+        }
+      }
+      
+      return { events };
+    });
+    
+    if (liveEvents.error) {
+      console.log(`❌ Error: ${liveEvents.error}`);
+      await browser.close();
+      return [];
+    }
+    
+    console.log(`📊 Found ${liveEvents.events.length} live events\n`);
+    
+    if (liveEvents.events.length === 0) {
+      await browser.close();
+      return [];
+    }
+    
+    const results = [];
+    
+    for (let i = 0; i < liveEvents.events.length; i++) {
+      const event = liveEvents.events[i];
+      console.log(`▶️  ${i + 1}/${liveEvents.events.length}: ${event.title}`);
+      
+      const eventM3u8Urls = [];
+      
+      const requestHandler = request => {
+        const url = request.url();
+        if (url.includes('.m3u8')) {
+          eventM3u8Urls.push(url);
+        }
+      };
+      
+      const responseHandler = async (response) => {
+        try {
+          const url = response.url();
+          if (url.includes('.m3u8')) {
+            eventM3u8Urls.push(url);
+          }
+        } catch (e) {}
+      };
+      
+      page.on('request', requestHandler);
+      page.on('response', responseHandler);
+      
+      try {
+        await page.goto(event.href, {
+          waitUntil: 'networkidle2',
+          timeout: 10000
+        }).catch(e => {});
+        
+        let waited = 0;
+        const maxWait = 3000;
+        const checkInterval = 500;
+        
+        while (eventM3u8Urls.length === 0 && waited < maxWait) {
+          await new Promise(resolve => setTimeout(resolve, checkInterval));
+          waited += checkInterval;
+        }
+        
+        if (eventM3u8Urls.length > 0) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        } else {
+          const frames = page.frames();
+          
+          for (let frameIndex = 0; frameIndex < frames.length; frameIndex++) {
+            const frame = frames[frameIndex];
+            try {
+              const hasVideo = await frame.evaluate(() => {
+                const video = document.querySelector('video');
+                if (video) {
+                  video.click();
+                  const playPromise = video.play();
+                  if (playPromise) {
+                    playPromise.catch(e => {});
+                  }
+                  return true;
+                }
+                return false;
+              }).catch(() => false);
+              
+              if (hasVideo) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                if (eventM3u8Urls.length > 0) {
+                  break;
+                }
+              }
+            } catch (e) {}
+          }
+        }
+        
+        page.off('request', requestHandler);
+        page.off('response', responseHandler);
+        
+        if (eventM3u8Urls.length > 0) {
+          const uniqueUrls = [...new Set(eventM3u8Urls)];
+          const masterPlaylists = uniqueUrls.filter(url => 
+            url.includes('index.m3u8') || url.includes('master.m3u8') || url.includes('playlist.m3u8')
+          );
+          
+          const urlsToUse = masterPlaylists.length > 0 ? masterPlaylists : uniqueUrls;
+          
+          console.log(`   ✅ Found ${urlsToUse.length} stream(s)`);
+          
+          results.push({
+            title: event.title,
+            channel: event.channel,
+            href: event.href,
+            m3u8Urls: urlsToUse
+          });
+        } else {
+          console.log(`   ❌ No streams found`);
+        }
+        
+      } catch (error) {
+        console.log(`   ❌ Error: ${error.message}`);
+      }
+    }
+    
+    await browser.close();
+    
+    console.log(`\n✅ Scrape complete: ${results.length}/${liveEvents.events.length} streams\n`);
+    
+    return results;
+    
+  } catch (error) {
+    console.error('❌ Scraping error:', error);
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {}
+    }
+    return [];
+  }
+}
+
+// ============================================================================
+// SCRAPER SCHEDULER
+// ============================================================================
+
+async function runScraper() {
+  if (isScraping) {
+    console.log('⏭️  Scraping in progress, skipping...');
+    return;
+  }
+
+  try {
+    isScraping = true;
+    console.log('\n🕷️  Starting scrape...');
+    
+    const results = await scrapePPVLiveStreams();
+    
+    cachedStreams = results.map((stream, index) => ({
+      id: `ppvto_${index}`,
+      title: stream.title,
+      channel: stream.channel,
+      href: stream.href,
+      m3u8Urls: stream.m3u8Urls.map(url => {
+        const b64 = Buffer.from(url).toString('base64');
+        return `${PUBLIC_URL}/proxy/${b64}`;
+      })
+    }));
+    
+    lastScrapeTime = new Date().toISOString();
+    
+    console.log(`✅ Updated cache: ${results.length} streams`);
+    console.log(`⏰ Next scrape in ${SCRAPE_INTERVAL / 1000} seconds\n`);
+    
+  } catch (error) {
+    console.error('❌ Scraping error:', error);
+  } finally {
+    isScraping = false;
+  }
+}
+
+function startScheduler() {
+  runScraper(); // Run immediately
+  setInterval(runScraper, SCRAPE_INTERVAL);
+}
+
+// ============================================================================
+// PROXY
+// ============================================================================
+
+function setupProxy(app) {
+  app.get('/proxy/:b64url', async (req, res) => {
+    try {
+      const targetUrl = Buffer.from(req.params.b64url, 'base64').toString('utf8');
+      
+      console.log(`📡 Proxy: ${targetUrl.substring(0, 60)}...`);
+      
+      const urlObj = new URL(targetUrl);
+      const protocol = urlObj.protocol === 'https:' ? https : http;
+      
+      const options = {
+        hostname: urlObj.hostname,
+        port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+        path: urlObj.pathname + urlObj.search,
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Accept': '*/*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Origin': 'https://ppv.to',
+          'Referer': 'https://ppv.to/',
+          'Connection': 'keep-alive',
+          'Sec-Fetch-Dest': 'empty',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Site': 'cross-site'
+        }
+      };
+      
+      if (req.headers.range) {
+        options.headers['Range'] = req.headers.range;
+      }
+      
+      const proxyReq = protocol.request(options, (proxyRes) => {
+        res.statusCode = proxyRes.statusCode;
+        
+        if (proxyRes.statusCode === 301 || proxyRes.statusCode === 302) {
+          const redirectUrl = proxyRes.headers.location;
+          const newB64 = Buffer.from(redirectUrl).toString('base64');
+          return res.redirect(`/proxy/${newB64}`);
+        }
+        
+        if (proxyRes.headers['content-type']) {
+          res.setHeader('Content-Type', proxyRes.headers['content-type']);
+        }
+        if (proxyRes.headers['content-length']) {
+          res.setHeader('Content-Length', proxyRes.headers['content-length']);
+        }
+        if (proxyRes.headers['content-range']) {
+          res.setHeader('Content-Range', proxyRes.headers['content-range']);
+        }
+        if (proxyRes.headers['accept-ranges']) {
+          res.setHeader('Accept-Ranges', proxyRes.headers['accept-ranges']);
+        }
+        
+        if (targetUrl.includes('.m3u8')) {
+          res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+          
+          let data = '';
+          
+          proxyRes.on('data', chunk => {
+            data += chunk.toString('utf8');
+          });
+          
+          proxyRes.on('end', () => {
+            const isValidM3U8 = data.includes('#EXTM3U') || data.includes('#EXT-X-');
+            
+            if (!isValidM3U8) {
+              return res.status(502).send('Invalid M3U8 response');
+            }
+            
+            const lines = data.split('\n');
+            const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+            
+            const rewrittenLines = lines.map(line => {
+              const trimmed = line.trim();
+              
+              if (trimmed.startsWith('#') || trimmed === '') {
+                return line;
+              }
+              
+              let fullUrl;
+              if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+                fullUrl = trimmed;
+              } else {
+                fullUrl = baseUrl + trimmed;
+              }
+              
+              const b64 = Buffer.from(fullUrl).toString('base64');
+              return `${PUBLIC_URL}/proxy/${b64}`;
+            });
+            
+            res.send(rewrittenLines.join('\n'));
+          });
+        } else {
+          proxyRes.pipe(res);
+        }
+      });
+      
+      proxyReq.on('error', error => {
+        console.error(`❌ Proxy error: ${error.message}`);
+        if (!res.headersSent) {
+          res.status(502).json({ error: error.message });
+        }
+      });
+      
+      proxyReq.end();
+      
+    } catch (error) {
+      console.error(`❌ Error: ${error.message}`);
+      res.status(500).json({ error: error.message });
+    }
+  });
+}
+
+// ============================================================================
+// STREMIO ADDON
+// ============================================================================
+
+const manifest = {
+  id: 'community.ppvto.livesports.render',
+  version: '1.0.0',
+  name: 'PPV.to Live Sports',
+  description: 'Live sports streams from PPV.to (Render)',
+  logo: 'https://via.placeholder.com/256x256/FF0000/FFFFFF?text=PPV',
+  resources: ['catalog', 'meta', 'stream'],
+  types: ['tv'],
+  catalogs: [
+    {
+      type: 'tv',
+      id: 'ppvto_live',
+      name: 'Live Now',
+      extra: [{ name: 'skip', isRequired: false }]
+    }
+  ],
+  idPrefixes: ['ppvto_']
+};
+
+// ============================================================================
+// EXPRESS APP
+// ============================================================================
+
+const app = express();
+
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS, HEAD');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Range');
+  res.header('Access-Control-Expose-Headers', '*');
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
+setupProxy(app);
+
+app.get('/manifest.json', (req, res) => {
+  res.json(manifest);
+});
+
+app.get('/catalog/tv/:id.json', async (req, res) => {
+  try {
+    if (req.params.id !== 'ppvto_live') {
+      return res.json({ metas: [] });
+    }
+
+    const metas = cachedStreams.map((stream) => ({
+      id: stream.id,
+      type: 'tv',
+      name: stream.title,
+      poster: 'https://via.placeholder.com/300x450/FF0000/FFFFFF?text=LIVE',
+      description: stream.channel ? `${stream.channel}\n\n🔴 LIVE NOW` : '🔴 LIVE NOW',
+      genres: ['Sports', 'Live'],
+      releaseInfo: '🔴 LIVE'
+    }));
+
+    res.json({ metas });
+  } catch (error) {
+    console.error('Catalog error:', error);
+    res.json({ metas: [] });
+  }
+});
+
+app.get('/meta/tv/:id.json', async (req, res) => {
+  try {
+    const stream = cachedStreams.find(s => s.id === req.params.id);
+    
+    if (!stream) {
+      return res.json({ meta: null });
+    }
+
+    res.json({
+      meta: {
+        id: stream.id,
+        type: 'tv',
+        name: stream.title,
+        poster: 'https://via.placeholder.com/300x450/FF0000/FFFFFF?text=LIVE',
+        description: stream.channel ? `Channel: ${stream.channel}\n\n🔴 LIVE NOW` : '🔴 LIVE NOW',
+        genres: ['Sports', 'Live'],
+        releaseInfo: '🔴 LIVE'
+      }
+    });
+  } catch (error) {
+    console.error('Meta error:', error);
+    res.json({ meta: null });
+  }
+});
+
+app.get('/stream/tv/:id.json', async (req, res) => {
+  try {
+    const stream = cachedStreams.find(s => s.id === req.params.id);
+    
+    if (!stream) {
+      return res.json({ streams: [] });
+    }
+
+    const streams = stream.m3u8Urls.map((url, idx) => ({
+      url: url,
+      title: `${stream.title} - Feed ${idx + 1}`,
+      behaviorHints: {
+        notWebReady: false
+      }
+    }));
+
+    res.json({ streams });
+  } catch (error) {
+    console.error('Stream error:', error);
+    res.json({ streams: [] });
+  }
+});
+
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>PPV.to Stremio Addon (Render)</title>
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          max-width: 900px;
+          margin: 50px auto;
+          padding: 20px;
+          background: #1a1a1a;
+          color: #fff;
+        }
+        .status {
+          padding: 20px;
+          background: #2a2a2a;
+          border-radius: 8px;
+          margin-bottom: 20px;
+        }
+        .success { color: #4CAF50; }
+        .warning { color: #FFC107; }
+        .install-link {
+          background: #4CAF50;
+          color: white;
+          padding: 15px 30px;
+          text-decoration: none;
+          border-radius: 5px;
+          display: inline-block;
+          margin: 20px 0;
+          font-weight: bold;
+        }
+        .code {
+          background: #000;
+          padding: 15px;
+          border-radius: 5px;
+          overflow-x: auto;
+          font-family: monospace;
+          font-size: 14px;
+        }
+      </style>
+    </head>
+    <body>
+      <h1>🎬 PPV.to Stremio Addon</h1>
+      
+      <div class="status">
+        <h2>Status: <span class="success">✅ Online</span></h2>
+        <p>Cached Streams: <strong>${cachedStreams.length}</strong></p>
+        <p>Last Scrape: <strong>${lastScrapeTime || 'Starting...'}</strong></p>
+        <p>Scrape Interval: <strong>90 seconds</strong></p>
+      </div>
+
+      <div class="status">
+        <h2>📦 Install in Stremio</h2>
+        <a href="stremio://${PUBLIC_URL}/manifest.json" class="install-link">
+          📦 Install Addon
+        </a>
+        <p>Or manually add:</p>
+        <div class="code">${PUBLIC_URL}/manifest.json</div>
+      </div>
+
+      <div class="status">
+        <h2>⚡ Why Render?</h2>
+        <p>✅ Scrapes every 90 seconds (vs 5 minutes)</p>
+        <p>✅ Always fresh stream URLs</p>
+        <p>✅ Real HTTPS (no certificates needed)</p>
+        <p>✅ Works from anywhere</p>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    cachedStreams: cachedStreams.length,
+    lastScrape: lastScrapeTime,
+    isScraping: isScraping,
+    scrapeInterval: SCRAPE_INTERVAL
+  });
+});
+
+// ============================================================================
+// START SERVER
+// ============================================================================
+
+app.listen(PORT, () => {
+  console.log('\n' + '='.repeat(80));
+  console.log('🚀 PPV.to Stremio Addon (Render.com)');
+  console.log('='.repeat(80));
+  console.log(`\n📡 Server: ${PUBLIC_URL}`);
+  console.log(`⚡ Scrape interval: ${SCRAPE_INTERVAL / 1000} seconds`);
+  console.log(`📦 Install: ${PUBLIC_URL}/manifest.json`);
+  console.log('\n' + '='.repeat(80) + '\n');
+  
+  startScheduler();
+});
