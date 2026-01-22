@@ -29,6 +29,7 @@ Complete Stremio addon for PPV.to live sports, optimized for Render.com deployme
    ppv-stremio-render/
    ├── server.js
    ├── package.json
+   ├── Dockerfile
    └── render.yaml
    ```
 
