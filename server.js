@@ -840,6 +840,57 @@ app.get('/debug/env', (req, res) => {
   });
 });
 
+// Test endpoint to check if PPV.to is accessible
+app.get('/debug/test-access', async (req, res) => {
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      executablePath: '/usr/bin/google-chrome-stable',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage'
+      ]
+    });
+    
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+    
+    const result = await page.goto('https://ppv.to/', { 
+      waitUntil: 'domcontentloaded',
+      timeout: 15000 
+    });
+    
+    const status = result.status();
+    const content = await page.content();
+    const title = await page.title();
+    
+    const bodyText = await page.evaluate(() => {
+      return document.body ? document.body.innerText.substring(0, 500) : 'No body';
+    });
+    
+    await browser.close();
+    
+    res.json({
+      accessible: status === 200,
+      status: status,
+      title: title,
+      bodyLength: content.length,
+      bodyPreview: bodyText,
+      blocked: bodyText.toLowerCase().includes('access denied') || 
+               bodyText.toLowerCase().includes('blocked') ||
+               bodyText.toLowerCase().includes('cloudflare')
+    });
+  } catch (error) {
+    if (browser) await browser.close();
+    res.json({
+      accessible: false,
+      error: error.message
+    });
+  }
+});
+
 // Manual scrape trigger with detailed output
 app.get('/debug/scrape', async (req, res) => {
   if (isScraping) {
