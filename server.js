@@ -66,7 +66,18 @@ async function scrapePPVLiveStreams() {
         '--disable-blink-features=AutomationControlled',
         '--disable-gpu',
         '--disable-extensions',
-        '--disable-software-rasterizer'
+        '--disable-software-rasterizer',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-webrtc', // Disable WebRTC to reduce UDP port noise
+        '--disable-webgl',
+        '--mute-audio',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--metrics-recording-only',
+        '--disable-default-apps'
       ],
       timeout: 30000
     });
@@ -242,28 +253,38 @@ async function scrapePPVLiveStreams() {
       try {
         console.log(`    🔗 Navigating to: ${event.href}`);
         
-        // Navigate and wait for network to settle
+        // Navigate with faster wait condition
         await page.goto(event.href, {
-          waitUntil: 'networkidle0',
-          timeout: 20000
+          waitUntil: 'domcontentloaded', // Faster than networkidle0
+          timeout: 15000
         }).catch(e => {
           console.log(`    ⚠️  Navigation timeout: ${e.message}`);
         });
         
-        // CRITICAL: Wait longer for streams to load
-        console.log(`    ⏳ Waiting 5s for streams to load...`);
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        // Wait for streams to start loading - adaptive wait
+        console.log(`    ⏳ Waiting for streams...`);
+        let waited = 0;
+        const maxInitialWait = 6000; // Max 6 seconds
+        const checkInterval = 500;
         
-        // Check what we got
+        while (eventM3u8Urls.length === 0 && waited < maxInitialWait) {
+          await new Promise(resolve => setTimeout(resolve, checkInterval));
+          waited += checkInterval;
+        }
+        
         if (eventM3u8Urls.length > 0) {
-          console.log(`    ✅ Found ${eventM3u8Urls.length} m3u8(s), waiting for variants...`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          console.log(`    ✅ Found m3u8 after ${waited}ms`);
+        }
+        if (eventM3u8Urls.length > 0) {
+          console.log(`    ✅ Found m3u8 after ${waited}ms`);
+          // Wait a bit more for variant playlists
+          await new Promise(resolve => setTimeout(resolve, 1500));
         } else {
           // Try interacting with video players in iframes
-          console.log(`    🎬 Trying video interaction...`);
+          console.log(`    🎬 No m3u8 found, trying video interaction...`);
           const frames = page.frames();
           
-          for (let frameIndex = 0; frameIndex < frames.length; frameIndex++) {
+          for (let frameIndex = 0; frameIndex < frames.length && eventM3u8Urls.length === 0; frameIndex++) {
             const frame = frames[frameIndex];
             try {
               const hasVideo = await frame.evaluate(() => {
@@ -281,32 +302,40 @@ async function scrapePPVLiveStreams() {
               }).catch(() => false);
               
               if (hasVideo) {
-                console.log(`    📺 Found video in frame ${frameIndex}, waiting...`);
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                console.log(`    📺 Video found in frame ${frameIndex}`);
+                // Wait for m3u8 after interaction
+                let videoWaited = 0;
+                const maxVideoWait = 3000;
+                
+                while (eventM3u8Urls.length === 0 && videoWaited < maxVideoWait) {
+                  await new Promise(resolve => setTimeout(resolve, 500));
+                  videoWaited += 500;
+                }
                 
                 if (eventM3u8Urls.length > 0) {
-                  console.log(`    ✅ m3u8 loaded after video interaction`);
+                  console.log(`    ✅ m3u8 loaded after video interaction (${videoWaited}ms)`);
                   break;
                 }
               }
-            } catch (e) {}
-          }
-          
-          // Final wait if still nothing
-          if (eventM3u8Urls.length === 0) {
-            console.log(`    ⏳ Final wait...`);
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            } catch (e) {
+              // Frame errors are normal, continue
+            }
           }
         }
-        
         // Clean up listeners
         page.off('request', requestHandler);
         page.off('response', responseHandler);
         
+        // Give a final moment for any last m3u8s to arrive
+        if (eventM3u8Urls.length > 0) {
+          console.log(`    ⏳ Final check for additional streams...`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        
         // Process results
         if (eventM3u8Urls.length > 0) {
           const uniqueUrls = [...new Set(eventM3u8Urls)];
-          console.log(`    ✅ Found ${uniqueUrls.length} unique m3u8 URL(s)`);
+          console.log(`    ✅ Total found: ${uniqueUrls.length} unique m3u8 URL(s)`);
           
           // Prefer master playlists
           const masterPlaylists = uniqueUrls.filter(url => 
@@ -324,13 +353,18 @@ async function scrapePPVLiveStreams() {
             m3u8Urls: urlsToUse
           });
           
-          console.log(`    ✅ Saved ${urlsToUse.length} stream(s) for this event`);
+          console.log(`    ✅ Saved ${urlsToUse.length} stream(s) for "${event.title}"`);
         } else {
-          console.log(`    ❌ No streams found for this event`);
+          console.log(`    ❌ No streams found for "${event.title}"`);
         }
         
       } catch (error) {
         console.log(`    ❌ Error processing event: ${error.message}`);
+        // Clean up listeners on error
+        try {
+          page.off('request', requestHandler);
+          page.off('response', responseHandler);
+        } catch (e) {}
       }
       
       // Small delay between events to avoid rate limiting
