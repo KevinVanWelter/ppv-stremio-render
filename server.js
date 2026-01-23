@@ -1,4 +1,164 @@
-// IMPROVED SCRAPER - Process each event
+// ============================================================================
+// COMPLETE SCRAPER FUNCTION - Replace entire scrapePPVLiveStreams function
+// ============================================================================
+
+async function scrapePPVLiveStreams() {
+  let browser;
+  
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      executablePath: '/usr/bin/google-chrome-stable',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-gpu',
+        '--disable-extensions',
+        '--disable-software-rasterizer'
+      ],
+      timeout: 30000
+    });
+    
+    const page = await browser.newPage();
+    
+    page.on('popup', async popup => {
+      await popup.close();
+    });
+    
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      window.chrome = { runtime: {} };
+      window.open = function() { return null; };
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    });
+    
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1920, height: 1080 });
+    
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br'
+    });
+    
+    console.log('🏠 Navigating to ppv.to...');
+    
+    try {
+      await page.goto('https://ppv.to/', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+    } catch (e) {
+      console.log('⚠️  Page load timeout, continuing...');
+    }
+    
+    console.log('✅ PPV.to loaded');
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    console.log('🔍 Scraping live games...');
+    
+    const liveEvents = await page.evaluate(() => {
+      const events = [];
+      let liveNowElement = null;
+      const allElements = Array.from(document.querySelectorAll('*'));
+      
+      for (const el of allElements) {
+        const text = (el.textContent || '').trim();
+        const lowerText = text.toLowerCase();
+        
+        if (!liveNowElement && lowerText === 'live now' && 
+            (el.tagName.match(/H[1-6]/) || el.innerHTML.includes('🔴') || text.includes('🔴'))) {
+          liveNowElement = el;
+          break;
+        }
+      }
+      
+      if (!liveNowElement) {
+        return { events, error: 'Could not find Live now heading' };
+      }
+      
+      let gamesContainer = liveNowElement.parentElement;
+      while (gamesContainer && !gamesContainer.querySelectorAll('a[href*="/live/"]').length) {
+        gamesContainer = gamesContainer.parentElement;
+      }
+      
+      if (!gamesContainer) {
+        return { events, error: 'Could not find games container' };
+      }
+      
+      const allGameLinks = Array.from(gamesContainer.querySelectorAll('a[href*="/live/"]'));
+      const seenHrefs = new Set();
+      const seenTitles = new Set();
+      
+      for (const link of allGameLinks) {
+        const href = link.getAttribute('href') || '';
+        
+        if (href.includes('jump') || href.includes('category') || href === '/live/sports') {
+          continue;
+        }
+        
+        if (seenHrefs.has(href)) {
+          continue;
+        }
+        
+        const card = link.closest('[class*="card"], [class*="item"], div');
+        if (!card) {
+          continue;
+        }
+        
+        const titleEl = card.querySelector('h5, h4, h3, [class*="title"]');
+        let title = '';
+        
+        if (titleEl) {
+          const allH5s = card.querySelectorAll('h5');
+          title = allH5s.length > 0 ? allH5s[0].textContent.trim() : titleEl.textContent.trim();
+        } else {
+          title = card.textContent.trim().split('\n')[0].trim();
+        }
+        
+        title = title.replace(/\s+/g, ' ').trim();
+        
+        if (seenTitles.has(title)) {
+          continue;
+        }
+        
+        const channelEl = card.querySelector('[class*="channel"], [class*="network"]');
+        const channel = channelEl ? channelEl.textContent.trim() : '';
+        
+        if (href && title && title.length > 3) {
+          seenHrefs.add(href);
+          seenTitles.add(title);
+          
+          events.push({
+            title: title,
+            channel: channel,
+            href: href.startsWith('http') ? href : `https://ppv.to${href}`
+          });
+        }
+      }
+      
+      return { events };
+    });
+    
+    if (liveEvents.error) {
+      console.log(`❌ Error: ${liveEvents.error}`);
+      await browser.close();
+      return [];
+    }
+    
+    console.log(`📊 Found ${liveEvents.events.length} live events\n`);
+    
+    if (liveEvents.events.length === 0) {
+      await browser.close();
+      return [];
+    }
+    
+    // PROCESS EACH EVENT
     const results = [];
     
     for (let i = 0; i < liveEvents.events.length; i++) {
@@ -34,19 +194,19 @@
         
         // Navigate and wait for network to settle
         await page.goto(event.href, {
-          waitUntil: 'networkidle0', // Wait for network to be idle
+          waitUntil: 'networkidle0',
           timeout: 20000
         }).catch(e => {
-          console.log(`    ⚠️  Navigation timeout`);
+          console.log(`    ⚠️  Navigation timeout: ${e.message}`);
         });
         
-        // Critical: Wait longer for streams to load
-        console.log(`    ⏳ Waiting for streams to load...`);
-        await new Promise(resolve => setTimeout(resolve, 4000));
+        // CRITICAL: Wait longer for streams to load
+        console.log(`    ⏳ Waiting 5s for streams to load...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
         
         // Check what we got
         if (eventM3u8Urls.length > 0) {
-          console.log(`    ✅ Found m3u8, waiting for variants...`);
+          console.log(`    ✅ Found ${eventM3u8Urls.length} m3u8(s), waiting for variants...`);
           await new Promise(resolve => setTimeout(resolve, 2000));
         } else {
           // Try interacting with video players in iframes
@@ -59,7 +219,6 @@
               const hasVideo = await frame.evaluate(() => {
                 const video = document.querySelector('video');
                 if (video) {
-                  // Try to play the video
                   video.muted = true;
                   video.click();
                   const playPromise = video.play();
@@ -83,7 +242,7 @@
             } catch (e) {}
           }
           
-          // Final wait
+          // Final wait if still nothing
           if (eventM3u8Urls.length === 0) {
             console.log(`    ⏳ Final wait...`);
             await new Promise(resolve => setTimeout(resolve, 2000));
@@ -129,3 +288,20 @@
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
     }
+    
+    await browser.close();
+    
+    console.log(`\n✅ Scrape complete: ${results.length}/${liveEvents.events.length} streams found\n`);
+    
+    return results;
+    
+  } catch (error) {
+    console.error('❌ Scraping error:', error);
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {}
+    }
+    return [];
+  }
+}
