@@ -9,8 +9,36 @@ const { URL } = require('url');
 // ============================================================================
 
 const PORT = process.env.PORT || 10000;
-const SCRAPE_INTERVAL = 90 * 1000; // 90 seconds - very frequent!
-const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const SCRAPE_INTERVAL = 90 * 1000; // 90 seconds
+
+// Render URL detection - Render doesn't set RENDER_EXTERNAL_URL automatically
+// You need to manually set it in Render dashboard or use the service name
+function getPublicUrl() {
+  // Check if manually set
+  if (process.env.RENDER_EXTERNAL_URL) {
+    return process.env.RENDER_EXTERNAL_URL;
+  }
+  
+  // Check if RENDER environment (Render sets RENDER=true)
+  if (process.env.RENDER === 'true') {
+    // Construct from service name if available
+    // Format: https://{service-name}.onrender.com
+    const serviceName = process.env.RENDER_SERVICE_NAME || 'ppv-stremio-addon';
+    return `https://${serviceName}.onrender.com`;
+  }
+  
+  // Local fallback
+  return `http://localhost:${PORT}`;
+}
+
+const PUBLIC_URL = getPublicUrl();
+
+console.log('🔍 Environment variables:');
+console.log(`   RENDER: ${process.env.RENDER}`);
+console.log(`   RENDER_EXTERNAL_URL: ${process.env.RENDER_EXTERNAL_URL || 'not set'}`);
+console.log(`   RENDER_SERVICE_NAME: ${process.env.RENDER_SERVICE_NAME || 'not set'}`);
+console.log(`   PORT: ${PORT}`);
+console.log(`🔗 PUBLIC_URL set to: ${PUBLIC_URL}`);
 
 // ============================================================================
 // STATE
@@ -37,7 +65,9 @@ async function scrapePPVLiveStreams() {
         '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled',
         '--disable-gpu',
-        '--disable-extensions'
+        '--disable-extensions',
+        '--disable-software-rasterizer',
+        '--disable-web-security' // Added for stream access
       ],
       timeout: 30000
     });
@@ -351,7 +381,7 @@ function setupProxy(app) {
     try {
       const targetUrl = Buffer.from(req.params.b64url, 'base64').toString('utf8');
       
-      console.log(`📡 Proxy: ${targetUrl.substring(0, 60)}...`);
+      console.log(`📡 Proxy request: ${targetUrl.substring(0, 80)}...`);
       
       const urlObj = new URL(targetUrl);
       const protocol = urlObj.protocol === 'https:' ? https : http;
@@ -367,10 +397,7 @@ function setupProxy(app) {
           'Accept-Language': 'en-US,en;q=0.9',
           'Origin': 'https://ppv.to',
           'Referer': 'https://ppv.to/',
-          'Connection': 'keep-alive',
-          'Sec-Fetch-Dest': 'empty',
-          'Sec-Fetch-Mode': 'cors',
-          'Sec-Fetch-Site': 'cross-site'
+          'Connection': 'keep-alive'
         }
       };
       
@@ -379,14 +406,19 @@ function setupProxy(app) {
       }
       
       const proxyReq = protocol.request(options, (proxyRes) => {
-        res.statusCode = proxyRes.statusCode;
-        
-        if (proxyRes.statusCode === 301 || proxyRes.statusCode === 302) {
+        // Handle redirects
+        if (proxyRes.statusCode === 301 || proxyRes.statusCode === 302 || proxyRes.statusCode === 307 || proxyRes.statusCode === 308) {
           const redirectUrl = proxyRes.headers.location;
-          const newB64 = Buffer.from(redirectUrl).toString('base64');
-          return res.redirect(`/proxy/${newB64}`);
+          if (redirectUrl) {
+            const newB64 = Buffer.from(redirectUrl).toString('base64');
+            console.log(`↪️  Redirect to: ${redirectUrl.substring(0, 80)}...`);
+            return res.redirect(`/proxy/${newB64}`);
+          }
         }
         
+        res.statusCode = proxyRes.statusCode;
+        
+        // Copy relevant headers
         if (proxyRes.headers['content-type']) {
           res.setHeader('Content-Type', proxyRes.headers['content-type']);
         }
@@ -399,6 +431,9 @@ function setupProxy(app) {
         if (proxyRes.headers['accept-ranges']) {
           res.setHeader('Accept-Ranges', proxyRes.headers['accept-ranges']);
         }
+        
+        // Set cache headers for better performance
+        res.setHeader('Cache-Control', 'public, max-age=3600');
         
         if (targetUrl.includes('.m3u8')) {
           res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
@@ -413,6 +448,7 @@ function setupProxy(app) {
             const isValidM3U8 = data.includes('#EXTM3U') || data.includes('#EXT-X-');
             
             if (!isValidM3U8) {
+              console.log('❌ Invalid M3U8 response');
               return res.status(502).send('Invalid M3U8 response');
             }
             
@@ -437,9 +473,12 @@ function setupProxy(app) {
               return `${PUBLIC_URL}/proxy/${b64}`;
             });
             
-            res.send(rewrittenLines.join('\n'));
+            const rewritten = rewrittenLines.join('\n');
+            console.log(`✅ Rewrote M3U8 (${lines.length} lines)`);
+            res.send(rewritten);
           });
         } else {
+          // For video segments, just pipe through
           proxyRes.pipe(res);
         }
       });
@@ -451,11 +490,21 @@ function setupProxy(app) {
         }
       });
       
+      proxyReq.setTimeout(30000, () => {
+        console.error('❌ Proxy timeout');
+        proxyReq.destroy();
+        if (!res.headersSent) {
+          res.status(504).json({ error: 'Gateway timeout' });
+        }
+      });
+      
       proxyReq.end();
       
     } catch (error) {
-      console.error(`❌ Error: ${error.message}`);
-      res.status(500).json({ error: error.message });
+      console.error(`❌ Proxy setup error: ${error.message}`);
+      if (!res.headersSent) {
+        res.status(500).json({ error: error.message });
+      }
     }
   });
 }
@@ -488,6 +537,9 @@ const manifest = {
 // ============================================================================
 
 const app = express();
+
+// Trust proxy (important for Render)
+app.set('trust proxy', true);
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -601,6 +653,7 @@ app.get('/', (req, res) => {
         }
         .success { color: #4CAF50; }
         .warning { color: #FFC107; }
+        .error { color: #f44336; }
         .install-link {
           background: #4CAF50;
           color: white;
@@ -619,6 +672,19 @@ app.get('/', (req, res) => {
           font-family: monospace;
           font-size: 14px;
         }
+        .stream-list {
+          max-height: 400px;
+          overflow-y: auto;
+          background: #000;
+          padding: 10px;
+          border-radius: 5px;
+        }
+        .stream-item {
+          padding: 10px;
+          margin: 5px 0;
+          background: #1a1a1a;
+          border-left: 3px solid #4CAF50;
+        }
       </style>
     </head>
     <body>
@@ -626,9 +692,11 @@ app.get('/', (req, res) => {
       
       <div class="status">
         <h2>Status: <span class="success">✅ Online</span></h2>
+        <p>Public URL: <strong>${PUBLIC_URL}</strong></p>
         <p>Cached Streams: <strong>${cachedStreams.length}</strong></p>
         <p>Last Scrape: <strong>${lastScrapeTime || 'Starting...'}</strong></p>
         <p>Scrape Interval: <strong>90 seconds</strong></p>
+        <p>Currently Scraping: <strong>${isScraping ? 'Yes' : 'No'}</strong></p>
       </div>
 
       <div class="status">
@@ -638,6 +706,21 @@ app.get('/', (req, res) => {
         </a>
         <p>Or manually add:</p>
         <div class="code">${PUBLIC_URL}/manifest.json</div>
+      </div>
+
+      <div class="status">
+        <h2>🔴 Current Live Streams</h2>
+        ${cachedStreams.length > 0 ? `
+          <div class="stream-list">
+            ${cachedStreams.map(s => `
+              <div class="stream-item">
+                <strong>${s.title}</strong>
+                ${s.channel ? `<br><small>${s.channel}</small>` : ''}
+                <br><small>${s.m3u8Urls.length} feed(s) available</small>
+              </div>
+            `).join('')}
+          </div>
+        ` : '<p class="warning">No streams currently available</p>'}
       </div>
 
       <div class="status">
@@ -655,10 +738,36 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
+    publicUrl: PUBLIC_URL,
     cachedStreams: cachedStreams.length,
     lastScrape: lastScrapeTime,
     isScraping: isScraping,
-    scrapeInterval: SCRAPE_INTERVAL
+    scrapeInterval: SCRAPE_INTERVAL,
+    streamDetails: cachedStreams.map(s => ({
+      id: s.id,
+      title: s.title,
+      feedCount: s.m3u8Urls.length
+    }))
+  });
+});
+
+// Diagnostic endpoint to check environment
+app.get('/debug/env', (req, res) => {
+  res.json({
+    PUBLIC_URL: PUBLIC_URL,
+    PORT: PORT,
+    environment: {
+      RENDER: process.env.RENDER,
+      RENDER_EXTERNAL_URL: process.env.RENDER_EXTERNAL_URL || 'NOT SET',
+      RENDER_SERVICE_NAME: process.env.RENDER_SERVICE_NAME || 'NOT SET',
+      NODE_ENV: process.env.NODE_ENV
+    },
+    requestInfo: {
+      host: req.get('host'),
+      protocol: req.protocol,
+      constructedUrl: `${req.protocol}://${req.get('host')}`
+    },
+    sampleProxyUrl: cachedStreams.length > 0 ? cachedStreams[0].m3u8Urls[0] : 'No streams cached yet'
   });
 });
 
@@ -666,7 +775,7 @@ app.get('/health', (req, res) => {
 // START SERVER
 // ============================================================================
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log('\n' + '='.repeat(80));
   console.log('🚀 PPV.to Stremio Addon (Render.com)');
   console.log('='.repeat(80));
