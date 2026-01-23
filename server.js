@@ -840,6 +840,22 @@ app.get('/debug/env', (req, res) => {
   });
 });
 
+// Manual scrape trigger with detailed output
+app.get('/debug/scrape', async (req, res) => {
+  if (isScraping) {
+    return res.json({ success: false, message: 'Scrape already in progress' });
+  }
+  
+  res.json({ 
+    success: true, 
+    message: 'Scraping started - check logs for detailed output',
+    tip: 'Logs will show page info, frame counts, and timing details'
+  });
+  
+  // Trigger scrape in background
+  runScraper();
+});
+
 // ============================================================================
 // START SERVER
 // ============================================================================
