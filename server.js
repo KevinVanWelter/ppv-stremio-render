@@ -9,7 +9,7 @@ const { URL } = require('url');
 // ============================================================================
 
 const PORT = process.env.PORT || 10000;
-const SCRAPE_INTERVAL = 90 * 1000; // 90 seconds
+const SCRAPE_INTERVAL = 90 * 1000;
 
 function getPublicUrl() {
   if (process.env.RENDER_EXTERNAL_URL) {
@@ -23,7 +23,6 @@ function getPublicUrl() {
 }
 
 const PUBLIC_URL = getPublicUrl();
-
 console.log('🔗 PUBLIC_URL set to:', PUBLIC_URL);
 
 // ============================================================================
@@ -34,8 +33,19 @@ let cachedStreams = [];
 let lastScrapeTime = null;
 let isScraping = false;
 
+// Persistent stream mapping
+const streamMapping = new Map();
+
+function generateStreamId(title) {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .substring(0, 50);
+}
+
 // ============================================================================
-// SCRAPER - SIMPLIFIED AND ROBUST
+// SCRAPER
 // ============================================================================
 
 async function scrapePPVLiveStreams() {
@@ -91,14 +101,26 @@ async function scrapePPVLiveStreams() {
         const text = (el.textContent || '').trim();
         const lowerText = text.toLowerCase();
         
-        if (!liveNowElement && lowerText === 'live now') {
+        if (!liveNowElement && (
+          lowerText === 'live now' || 
+          lowerText === 'live' ||
+          lowerText.includes('live now') ||
+          (el.innerHTML && el.innerHTML.includes('🔴'))
+        )) {
           liveNowElement = el;
           break;
         }
       }
       
       if (!liveNowElement) {
-        return { events, error: 'Could not find Live now heading' };
+        const liveLinks = Array.from(document.querySelectorAll('a[href*="/live/"]'));
+        if (liveLinks.length > 0) {
+          liveNowElement = liveLinks[0].closest('div, section');
+        }
+      }
+      
+      if (!liveNowElement) {
+        return { events, error: 'Could not find Live now heading or live links' };
       }
       
       let gamesContainer = liveNowElement.parentElement;
@@ -158,7 +180,7 @@ async function scrapePPVLiveStreams() {
     });
     
     if (liveEvents.error) {
-      console.log(`❌ Error: ${liveEvents.error}`);
+      console.log(`⚠️  ${liveEvents.error}`);
       await browser.close();
       return [];
     }
@@ -166,6 +188,7 @@ async function scrapePPVLiveStreams() {
     console.log(`📊 Found ${liveEvents.events.length} live events\n`);
     
     if (liveEvents.events.length === 0) {
+      console.log('ℹ️  No live events found');
       await browser.close();
       return [];
     }
@@ -180,8 +203,7 @@ async function scrapePPVLiveStreams() {
       
       const requestHandler = request => {
         const url = request.url();
-        // IMPORTANT: Only capture m3u8s, not from our own proxy domain
-        if (url.includes('.m3u8') && !url.includes(PUBLIC_URL)) {
+        if (url.includes('.m3u8')) {
           console.log(`    📡 M3U8: ${url.substring(0, 70)}...`);
           eventM3u8Urls.push(url);
         }
@@ -190,8 +212,7 @@ async function scrapePPVLiveStreams() {
       const responseHandler = async (response) => {
         try {
           const url = response.url();
-          // IMPORTANT: Only capture m3u8s, not from our own proxy domain
-          if (url.includes('.m3u8') && !url.includes(PUBLIC_URL)) {
+          if (url.includes('.m3u8')) {
             eventM3u8Urls.push(url);
           }
         } catch (e) {}
@@ -203,22 +224,20 @@ async function scrapePPVLiveStreams() {
       try {
         console.log(`    🌐 Loading: ${event.href}`);
         
-        await eventPage.goto(event.href, {
+        await page.goto(event.href, {
           waitUntil: 'domcontentloaded',
           timeout: 25000
         }).catch(() => console.log(`    ⚠️  Timeout (continuing)`));
         
-        // Wait longer - streams take time to load
         console.log(`    ⏱️  Waiting 15 seconds for streams...`);
         await new Promise(resolve => setTimeout(resolve, 15000));
         
         console.log(`    📊 Found ${eventM3u8Urls.length} m3u8 URLs so far`);
         
-        // If no m3u8s yet, try clicking videos
         if (eventM3u8Urls.length === 0) {
           console.log(`    🎬 Trying video interaction...`);
           
-          const frames = eventPage.frames();
+          const frames = page.frames();
           console.log(`    📁 Checking ${frames.length} frames`);
           
           for (let f = 0; f < Math.min(frames.length, 5); f++) {
@@ -240,14 +259,13 @@ async function scrapePPVLiveStreams() {
             } catch (e) {}
           }
           
-          // Final wait
           if (eventM3u8Urls.length > 0) {
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
         }
         
-        eventPage.off('request', requestHandler);
-        eventPage.off('response', responseHandler);
+        page.off('request', requestHandler);
+        page.off('response', responseHandler);
         
         if (eventM3u8Urls.length > 0) {
           const uniqueUrls = [...new Set(eventM3u8Urls)];
@@ -265,11 +283,8 @@ async function scrapePPVLiveStreams() {
         
       } catch (error) {
         console.log(`    ❌ Error: ${error.message}`);
-        eventPage.off('request', requestHandler);
-        eventPage.off('response', responseHandler);
-      } finally {
-        // Close the event page to free memory
-        await eventPage.close().catch(() => {});
+        page.off('request', requestHandler);
+        page.off('response', responseHandler);
       }
     }
     
@@ -302,16 +317,27 @@ async function runScraper() {
     
     const results = await scrapePPVLiveStreams();
     
-    cachedStreams = results.map((stream, index) => ({
-      id: `ppvto_${index}`,
-      title: stream.title,
-      channel: stream.channel,
-      href: stream.href,
-      m3u8Urls: stream.m3u8Urls.map(url => {
-        const b64 = Buffer.from(url).toString('base64');
-        return `${PUBLIC_URL}/proxy/${b64}`;
-      })
-    }));
+    cachedStreams = results.map((stream) => {
+      const streamId = generateStreamId(stream.title);
+      
+      streamMapping.set(streamId, {
+        title: stream.title,
+        channel: stream.channel,
+        href: stream.href,
+        m3u8Urls: stream.m3u8Urls,
+        lastUpdated: new Date()
+      });
+      
+      return {
+        id: streamId,
+        title: stream.title,
+        channel: stream.channel,
+        href: stream.href,
+        streamUrls: stream.m3u8Urls.map((_, idx) => 
+          `${PUBLIC_URL}/stream/${streamId}/feed${idx + 1}.m3u8`
+        )
+      };
+    });
     
     lastScrapeTime = new Date().toISOString();
     console.log(`✅ Updated cache: ${results.length} streams`);
@@ -333,84 +359,110 @@ function startScheduler() {
 // PROXY
 // ============================================================================
 
+async function proxyM3u8(targetUrl, res) {
+  const urlObj = new URL(targetUrl);
+  const protocol = urlObj.protocol === 'https:' ? https : http;
+  
+  const options = {
+    hostname: urlObj.hostname,
+    port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+    path: urlObj.pathname + urlObj.search,
+    method: 'GET',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': '*/*',
+      'Origin': 'https://ppv.to',
+      'Referer': 'https://ppv.to/'
+    }
+  };
+  
+  const proxyReq = protocol.request(options, (proxyRes) => {
+    if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
+      const newB64 = Buffer.from(proxyRes.headers.location).toString('base64');
+      return res.redirect(`/proxy/${newB64}`);
+    }
+    
+    res.statusCode = proxyRes.statusCode;
+    
+    if (proxyRes.headers['content-type']) {
+      res.setHeader('Content-Type', proxyRes.headers['content-type']);
+    }
+    if (proxyRes.headers['content-length']) {
+      res.setHeader('Content-Length', proxyRes.headers['content-length']);
+    }
+    
+    if (targetUrl.includes('.m3u8')) {
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      
+      let data = '';
+      proxyRes.on('data', chunk => { data += chunk.toString('utf8'); });
+      proxyRes.on('end', () => {
+        if (!data.includes('#EXTM3U')) {
+          return res.status(502).send('Invalid M3U8');
+        }
+        
+        const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+        const rewritten = data.split('\n').map(line => {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('#') || trimmed === '') return line;
+          
+          const fullUrl = trimmed.startsWith('http') ? trimmed : baseUrl + trimmed;
+          const b64 = Buffer.from(fullUrl).toString('base64');
+          return `${PUBLIC_URL}/proxy/${b64}`;
+        }).join('\n');
+        
+        res.send(rewritten);
+      });
+    } else {
+      proxyRes.pipe(res);
+    }
+  });
+  
+  proxyReq.on('error', error => {
+    console.error(`❌ Proxy error: ${error.message}`);
+    if (!res.headersSent) res.status(502).json({ error: error.message });
+  });
+  
+  proxyReq.setTimeout(30000, () => {
+    proxyReq.destroy();
+    if (!res.headersSent) res.status(504).json({ error: 'Timeout' });
+  });
+  
+  proxyReq.end();
+}
+
 function setupProxy(app) {
+  app.get('/stream/:streamId/:feedId', async (req, res) => {
+    try {
+      const { streamId, feedId } = req.params;
+      
+      const streamData = streamMapping.get(streamId);
+      if (!streamData) {
+        console.log(`❌ Stream not found: ${streamId}`);
+        return res.status(404).send('Stream not found');
+      }
+      
+      const feedIndex = parseInt(feedId.replace(/\D/g, '')) - 1;
+      if (feedIndex < 0 || feedIndex >= streamData.m3u8Urls.length) {
+        return res.status(404).send('Feed not found');
+      }
+      
+      const targetUrl = streamData.m3u8Urls[feedIndex];
+      console.log(`📺 Stream ${streamId} feed ${feedIndex + 1}: ${targetUrl.substring(0, 60)}...`);
+      
+      return proxyM3u8(targetUrl, res);
+      
+    } catch (error) {
+      console.error(`❌ Stream error: ${error.message}`);
+      if (!res.headersSent) res.status(500).send('Stream error');
+    }
+  });
+  
   app.get('/proxy/:b64url', async (req, res) => {
     try {
       const targetUrl = Buffer.from(req.params.b64url, 'base64').toString('utf8');
       console.log(`📡 Proxy: ${targetUrl.substring(0, 70)}...`);
-      
-      const urlObj = new URL(targetUrl);
-      const protocol = urlObj.protocol === 'https:' ? https : http;
-      
-      const options = {
-        hostname: urlObj.hostname,
-        port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
-        path: urlObj.pathname + urlObj.search,
-        method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': '*/*',
-          'Origin': 'https://ppv.to',
-          'Referer': 'https://ppv.to/'
-        }
-      };
-      
-      if (req.headers.range) {
-        options.headers['Range'] = req.headers.range;
-      }
-      
-      const proxyReq = protocol.request(options, (proxyRes) => {
-        if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
-          const newB64 = Buffer.from(proxyRes.headers.location).toString('base64');
-          return res.redirect(`/proxy/${newB64}`);
-        }
-        
-        res.statusCode = proxyRes.statusCode;
-        
-        if (proxyRes.headers['content-type']) res.setHeader('Content-Type', proxyRes.headers['content-type']);
-        if (proxyRes.headers['content-length']) res.setHeader('Content-Length', proxyRes.headers['content-length']);
-        if (proxyRes.headers['content-range']) res.setHeader('Content-Range', proxyRes.headers['content-range']);
-        if (proxyRes.headers['accept-ranges']) res.setHeader('Accept-Ranges', proxyRes.headers['accept-ranges']);
-        
-        if (targetUrl.includes('.m3u8')) {
-          res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-          
-          let data = '';
-          proxyRes.on('data', chunk => { data += chunk.toString('utf8'); });
-          proxyRes.on('end', () => {
-            if (!data.includes('#EXTM3U')) {
-              return res.status(502).send('Invalid M3U8');
-            }
-            
-            const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-            const rewritten = data.split('\n').map(line => {
-              const trimmed = line.trim();
-              if (trimmed.startsWith('#') || trimmed === '') return line;
-              
-              const fullUrl = trimmed.startsWith('http') ? trimmed : baseUrl + trimmed;
-              const b64 = Buffer.from(fullUrl).toString('base64');
-              return `${PUBLIC_URL}/proxy/${b64}`;
-            }).join('\n');
-            
-            res.send(rewritten);
-          });
-        } else {
-          proxyRes.pipe(res);
-        }
-      });
-      
-      proxyReq.on('error', error => {
-        console.error(`❌ Proxy error: ${error.message}`);
-        if (!res.headersSent) res.status(502).json({ error: error.message });
-      });
-      
-      proxyReq.setTimeout(30000, () => {
-        proxyReq.destroy();
-        if (!res.headersSent) res.status(504).json({ error: 'Timeout' });
-      });
-      
-      proxyReq.end();
-      
+      return proxyM3u8(targetUrl, res);
     } catch (error) {
       console.error(`❌ Proxy error: ${error.message}`);
       if (!res.headersSent) res.status(500).json({ error: error.message });
@@ -487,7 +539,7 @@ app.get('/stream/tv/:id.json', (req, res) => {
   const stream = cachedStreams.find(s => s.id === req.params.id);
   if (!stream) return res.json({ streams: [] });
   
-  const streams = stream.m3u8Urls.map((url, idx) => ({
+  const streams = stream.streamUrls.map((url, idx) => ({
     url: url,
     title: `${stream.title} - Feed ${idx + 1}`,
     behaviorHints: { notWebReady: false }
